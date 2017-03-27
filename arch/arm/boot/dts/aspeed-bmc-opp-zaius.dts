@@ -27,26 +27,6 @@
 		};
 	};
 
-	onewire0 {
-		compatible = "w1-gpio";
-		gpios = <&gpio ASPEED_GPIO(H, 0) GPIO_ACTIVE_HIGH>;
-	};
-
-	onewire1 {
-		compatible = "w1-gpio";
-		gpios = <&gpio ASPEED_GPIO(H, 1) GPIO_ACTIVE_HIGH>;
-	};
-
-	onewire2 {
-		compatible = "w1-gpio";
-		gpios = <&gpio ASPEED_GPIO(H, 2) GPIO_ACTIVE_HIGH>;
-	};
-
-	onewire3 {
-		compatible = "w1-gpio";
-		gpios = <&gpio ASPEED_GPIO(H, 3) GPIO_ACTIVE_HIGH>;
-	};
-
 	leds {
 		compatible = "gpio-leds";
 
