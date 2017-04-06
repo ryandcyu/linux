@@ -238,6 +238,7 @@ static int ast_vuart_probe(struct platform_device *pdev)
 		port.port.line = rc;
 
 	port.port.irq = irq_of_parse_and_map(np, 0);
+	port.port.irqflags = IRQF_SHARED;
 	port.port.iotype = UPIO_MEM;
 	if (of_property_read_u32(np, "reg-io-width", &prop) == 0) {
 		switch (prop) {
@@ -259,7 +260,7 @@ static int ast_vuart_probe(struct platform_device *pdev)
 	port.port.type = PORT_16550A;
 	port.port.uartclk = clk;
 	port.port.flags = UPF_SHARE_IRQ | UPF_BOOT_AUTOCONF
-		| UPF_FIXED_PORT | UPF_FIXED_TYPE;
+		| UPF_FIXED_PORT | UPF_FIXED_TYPE | UPF_NO_THRE_TEST;
 
 	if (of_find_property(np, "no-loopback-test", NULL))
 		port.port.flags |= UPF_SKIP_TEST;
