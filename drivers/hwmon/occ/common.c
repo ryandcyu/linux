@@ -163,9 +163,22 @@ void occ_parse_poll_response(struct occ *occ)
 	}
 }
 
+void occ_set_error(struct occ *occ, int error)
+{
+	occ->error_count++;
+	if (occ->error_count > OCC_ERROR_COUNT_THRESHOLD)
+		occ->error = error;
+}
+
+void occ_reset_error(struct occ *occ)
+{
+	occ->error_count = 0;
+	occ->error = 0;
+}
+
 int occ_poll(struct occ *occ)
 {
-	int rc;
+	int rc, error = occ->error;
 	struct occ_poll_response_header *header;
 	u16 checksum = occ->poll_cmd_data + 1;
 	u8 cmd[8];
@@ -181,7 +194,7 @@ int occ_poll(struct occ *occ)
 
 	rc = occ->send_cmd(occ, cmd);
 	if (rc)
-		return rc;
+		goto done;
 
 	header = (struct occ_poll_response_header *)occ->resp.data;
 
@@ -197,19 +210,21 @@ int occ_poll(struct occ *occ)
 
 	if (header->status & OCC_STAT_MASTER) {
 		if (hweight8(header->occs_present) !=
-		    atomic_read(&occ_num_occs)) {
-			occ->error = -EXDEV;
-			occ->bad_present_count++;
-		} else
-			occ->bad_present_count = 0;
+		    atomic_read(&occ_num_occs))
+			occ->error = -ENXIO;
 	}
+
+done:
+	/* notify userspace if we change error state and have an error */
+	if (occ->error != error && occ->error && occ->error_attr_name)
+		sysfs_notify(&occ->bus_dev->kobj, NULL, occ->error_attr_name);
 
 	return rc;
 }
 
 int occ_set_user_power_cap(struct occ *occ, u16 user_power_cap)
 {
-	int rc;
+	int rc, error = occ->error;
 	u8 cmd[8];
 	u16 checksum = 0x24;
 	__be16 user_power_cap_be;
@@ -239,6 +254,10 @@ int occ_set_user_power_cap(struct occ *occ, u16 user_power_cap)
 	rc = occ->send_cmd(occ, cmd);
 	mutex_unlock(&occ->lock);
 
+	/* notify userspace if we change error state and have an error*/
+	if (occ->error != error && occ->error && occ->error_attr_name)
+		sysfs_notify(&occ->bus_dev->kobj, NULL, occ->error_attr_name);
+
 	return rc;
 }
 
@@ -260,14 +279,9 @@ int occ_update_response(struct occ *occ)
 static ssize_t occ_show_error(struct device *dev,
 			      struct device_attribute *attr, char *buf)
 {
-	int error = 0;
 	struct occ *occ = dev_get_drvdata(dev);
 
-	if (occ->error_count > OCC_ERROR_COUNT_THRESHOLD || occ->last_safe ||
-	    occ->bad_present_count > OCC_ERROR_COUNT_THRESHOLD)
-		error = occ->error;
-
-	return snprintf(buf, PAGE_SIZE - 1, "%d\n", error);
+	return snprintf(buf, PAGE_SIZE - 1, "%d\n", occ->error);
 }
 
 static ssize_t occ_show_status(struct device *dev,
@@ -565,6 +579,14 @@ static ssize_t occ_show_power_a0(struct device *dev,
 	case 14:
 		val = get_unaligned_be64(&power->vdn.accumulator);
 		break;
+	case 15:
+		return snprintf(buf, PAGE_SIZE - 1, "system\n");
+	case 16:
+		return snprintf(buf, PAGE_SIZE - 1, "proc\n");
+	case 17:
+		return snprintf(buf, PAGE_SIZE - 1, "vdd\n");
+	case 18:
+		return snprintf(buf, PAGE_SIZE - 1, "vdn\n");
 	}
 
 	return snprintf(buf, PAGE_SIZE - 1, "%llu\n", val);
@@ -804,7 +826,7 @@ int occ_setup_sensor_attrs(struct occ *occ)
 		show_power = occ_show_power_2;
 		break;
 	case 0xA0:
-		occ->num_attrs += (sensors->power.num_sensors * 15);
+		occ->num_attrs += (sensors->power.num_sensors * 19);
 		show_power = occ_show_power_a0;
 		break;
 	default:
@@ -888,91 +910,125 @@ int occ_setup_sensor_attrs(struct occ *occ)
 			s = i + 1;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_label", s);
+				 "power%d_id", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 0, i);
 			attr++;
 
+			/* system power attributes */
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_system_update_time", s);
+				 "power%d_label", s);
+			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
+						     show_power, NULL, 15, i);
+			attr++;
+
+			snprintf(attr->name, sizeof(attr->name),
+				 "power%d_update_time", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 1, i);
 			attr++;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_system_value", s);
+				 "power%d_input", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 2, i);
 			attr++;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_system_update_tag", s);
+				 "power%d_update_tag", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 3, i);
 			attr++;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_system_accumulator", s);
+				 "power%d_accumulator", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 4, i);
 			attr++;
 
+			s++;
+
+			/* proc power attributes */
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_proc_update_time", s);
+				 "power%d_label", s);
+			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
+						     show_power, NULL, 16, i);
+			attr++;
+
+			snprintf(attr->name, sizeof(attr->name),
+				 "power%d_update_time", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 5, i);
 			attr++;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_proc_value", s);
+				 "power%d_input", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 6, i);
 			attr++;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_proc_update_tag", s);
+				 "power%d_update_tag", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 7, i);
 			attr++;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_proc_accumulator", s);
+				 "power%d_accumulator", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 8, i);
 			attr++;
 
+			s++;
+
+			/* vdd power attributes */
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_vdd_value", s);
+				 "power%d_label", s);
+			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
+						     show_power, NULL, 17, i);
+			attr++;
+
+			snprintf(attr->name, sizeof(attr->name),
+				 "power%d_input", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 9, i);
 			attr++;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_vdd_update_tag", s);
+				 "power%d_update_tag", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 10, i);
 			attr++;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_vdd_accumulator", s);
+				 "power%d_accumulator", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 11, i);
 			attr++;
 
+			s++;
+
+			/* vdn power attributes */
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_vdn_value", s);
+				 "power%d_label", s);
+			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
+						     show_power, NULL, 18, i);
+			attr++;
+
+			snprintf(attr->name, sizeof(attr->name),
+				 "power%d_input", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 12, i);
 			attr++;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_vdn_update_tag", s);
+				 "power%d_update_tag", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 13, i);
 			attr++;
 
 			snprintf(attr->name, sizeof(attr->name),
-				 "power%d_vdn_accumulator", s);
+				 "power%d_accumulator", s);
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_power, NULL, 14, i);
 			attr++;
@@ -1152,6 +1208,7 @@ int occ_create_status_attrs(struct occ *occ)
 		(struct sensor_device_attribute)SENSOR_ATTR(occ_error, 0444,
 							    occ_show_error,
 							    NULL, 0);
+	occ->error_attr_name = occ->status_attrs[7].dev_attr.attr.name;
 
 	for (i = 0; i < OCC_NUM_STATUS_ATTRS; ++i) {
 		rc = device_create_file(dev, &occ->status_attrs[i].dev_attr);

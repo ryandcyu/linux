@@ -103,7 +103,6 @@ struct occ {
 
 	int error;
 	unsigned int error_count;
-	unsigned int bad_present_count;
 	unsigned long last_safe;
 	unsigned long last_update;
 	struct mutex lock;
@@ -116,6 +115,7 @@ struct occ {
 	struct attribute_group group;
 	const struct attribute_group *groups[2];
 	struct sensor_device_attribute *status_attrs;
+	const char *error_attr_name;
 
 	u8 poll_cmd_data;
 	int (*send_cmd)(struct occ *occ, u8 *cmd);
@@ -143,6 +143,8 @@ struct occ {
 extern atomic_t occ_num_occs;
 
 void occ_parse_poll_response(struct occ *occ);
+void occ_reset_error(struct occ *occ);
+void occ_set_error(struct occ *occ, int error);
 int occ_poll(struct occ *occ);
 int occ_set_user_power_cap(struct occ *occ, u16 user_power_cap);
 int occ_update_response(struct occ *occ);
