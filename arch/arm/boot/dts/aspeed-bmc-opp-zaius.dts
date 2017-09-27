@@ -88,6 +88,33 @@
 
 #include "ibm-power9-cfam.dtsi"
 
+&pwm_tacho {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_pwm0_default &pinctrl_pwm1_default
+		&pinctrl_pwm2_default &pinctrl_pwm3_default>;
+
+	fan@0 {
+		reg = <0x00>;
+		aspeed,fan-tach-ch = /bits/ 8 <0x00>;
+	};
+
+	fan@1 {
+		reg = <0x01>;
+		aspeed,fan-tach-ch = /bits/ 8 <0x01>;
+	};
+
+	fan@2 {
+		reg = <0x02>;
+		aspeed,fan-tach-ch = /bits/ 8 <0x02>;
+	};
+
+	fan@3 {
+		reg = <0x03>;
+		aspeed,fan-tach-ch = /bits/ 8 <0x03>;
+	};
+};
+
 &fmc {
 	status = "okay";
 	flash@0 {
@@ -134,6 +161,11 @@
 	status = "okay";
 	memory-region = <&flash_memory>;
 	flash = <&spi1>;
+};
+
+&lpc_snoop {
+	status = "okay";
+	snoop-ports = <0x80>;
 };
 
 &mbox {
@@ -273,9 +305,12 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 
-			hotswap@10 {
-				compatible = "ti,lm5066";
-				reg = <0x10>;
+			hotswap@54 {
+				/* Device is LM5066I so prefer that driver
+				 * support if available
+				 */
+				compatible = "ti,lm5066i", "ti,lm5066";
+				reg = <0x54>;
 			};
 		};
 	};

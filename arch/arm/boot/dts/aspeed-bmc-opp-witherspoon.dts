@@ -87,48 +87,50 @@
 		};
 	};
 
-	pca_leds {
+	leds {
 		compatible = "gpio-leds";
 
 		fan0 {
-			label = "fan0";
+			retain-state-shutdown;
 			default-state = "keep";
 			gpios = <&pca0 0 GPIO_ACTIVE_LOW>;
 		};
+
 		fan1 {
-			label = "fan1";
+			retain-state-shutdown;
 			default-state = "keep";
 			gpios = <&pca0 1 GPIO_ACTIVE_LOW>;
 		};
+
 		fan2 {
-			label = "fan2";
+			retain-state-shutdown;
 			default-state = "keep";
 			gpios = <&pca0 2 GPIO_ACTIVE_LOW>;
 		};
+
 		fan3 {
-			label = "fan3";
+			retain-state-shutdown;
 			default-state = "keep";
 			gpios = <&pca0 3 GPIO_ACTIVE_LOW>;
 		};
-		front_fault {
-			label = "front-fault";
+
+		front-fault {
+			retain-state-shutdown;
 			default-state = "keep";
 			gpios = <&pca0 13 GPIO_ACTIVE_LOW>;
 		};
-		front_power {
-			label = "front-power";
+
+		front-power {
+			retain-state-shutdown;
 			default-state = "keep";
 			gpios = <&pca0 14 GPIO_ACTIVE_LOW>;
 		};
-		front_id {
-			label = "front-id";
+
+		front-id {
+			retain-state-shutdown;
 			default-state = "keep";
 			gpios = <&pca0 15 GPIO_ACTIVE_LOW>;
 		};
-	};
-
-	leds {
-		compatible = "gpio-leds";
 
 		rear-fault {
 			gpios = <&gpio ASPEED_GPIO(N, 2) GPIO_ACTIVE_LOW>;
