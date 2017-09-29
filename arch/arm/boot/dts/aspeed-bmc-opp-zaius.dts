@@ -89,7 +89,7 @@
 #include "ibm-power9-cfam.dtsi"
 
 &pwm_tacho {
-	status = "okay";
+	status = "diable";
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_pwm0_default &pinctrl_pwm1_default
 		&pinctrl_pwm2_default &pinctrl_pwm3_default>;
