@@ -131,6 +131,10 @@ static void __init do_firestone_setup(void)
 
 	/* Override serial destination to use the dedicated serial port */
 	writel(0x00004000, AST_IO(AST_BASE_LPC | 0x174));
+
+	/* Workaround to make hostboot run into default SUART init */
+	/* Otherwise it fails to boot */
+	writel(0x00000000, AST_IO(AST_BASE_LPC | 0x170));
 }
 
 static void __init do_garrison_setup(void)
@@ -293,6 +297,20 @@ static void __init do_witherspoon_setup(void)
 	writel(reg | BIT(9), AST_IO(AST_BASE_GPIO | 0x12c));
 }
 
+static void __init do_romulus_setup(void)
+{
+	unsigned long reg;
+
+	do_common_setup();
+
+	/* Reset tolerance for BMC_POWER_UP (GPIOD1) */
+	reg = readl(AST_IO(AST_BASE_GPIO | 0x01c));
+	writel(reg | BIT(25), AST_IO(AST_BASE_GPIO | 0x01c));
+
+	/* Reset tolerance for SOFTWARE_PGOOD (GPIOR1) and SEQ_CONT (GPIOS7) */
+	reg = readl(AST_IO(AST_BASE_GPIO | 0x12c));
+	writel(reg | BIT(9) | BIT(23), AST_IO(AST_BASE_GPIO | 0x12c));
+}
 
 static void __init do_lanyang_setup(void)
 {
@@ -317,25 +335,6 @@ static void __init do_mellanox_setup(void)
 	writel(reg, AST_IO(AST_BASE_SCU | 0x48));
 }
 
-static void __init do_romulus_setup(void)
-{
-	unsigned long reg;
-	do_common_setup();
-
-	/* Set SPI1 CE1 decoding window to 0x34000000 */
-	writel(0x70680000, AST_IO(AST_BASE_SPI | 0x34));
-
-	/* Set SPI1 CE0 decoding window to 0x30000000 */
-	writel(0x68600000, AST_IO(AST_BASE_SPI | 0x30));
-
-    /* Disable default behavior of UART1 being held in reset by LPCRST#.
-     * By releasing UART1 from being controlled by LPC reset, it becomes
-     * immediately available regardless of the host being up.
-     */
-    reg = readl(AST_IO(AST_BASE_LPC | 0x98));
-    /* Clear "Enable UART1 reset source from LPC" */
-    writel(reg & ~BIT(4), AST_IO(AST_BASE_LPC | 0x98));
-}
 
 #define SCU_PASSWORD	0x1688A8A8
 

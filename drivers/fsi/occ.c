@@ -10,16 +10,22 @@
 #include <asm/unaligned.h>
 #include <linux/device.h>
 #include <linux/err.h>
+#include <linux/errno.h>
+#include <linux/fs.h>
 #include <linux/fsi-sbefifo.h>
-#include <linux/init.h>
+#include <linux/idr.h>
 #include <linux/kernel.h>
+#include <linux/list.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/occ.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -28,55 +34,47 @@
 #define OCC_CMD_DATA_BYTES	4090
 #define OCC_RESP_DATA_BYTES	4089
 
+#define OCC_TIMEOUT_MS		1000
+#define OCC_CMD_IN_PRG_WAIT_MS	50
+
 struct occ {
 	struct device *sbefifo;
 	char name[32];
 	int idx;
 	struct miscdevice mdev;
 	struct list_head xfrs;
-	spinlock_t list_lock;
-	struct mutex occ_lock;
+	spinlock_t list_lock;		/* lock access to the xfrs list */
+	struct mutex occ_lock;		/* lock access to the hardware */
 	struct work_struct work;
+	bool cancel;
 };
 
 #define to_occ(x)	container_of((x), struct occ, mdev)
-
-struct occ_command {
-	u8 seq_no;
-	u8 cmd_type;
-	u16 data_length;
-	u8 data[OCC_CMD_DATA_BYTES];
-	u16 checksum;
-} __packed;
 
 struct occ_response {
 	u8 seq_no;
 	u8 cmd_type;
 	u8 return_status;
-	u16 data_length;
+	__be16 data_length;
 	u8 data[OCC_RESP_DATA_BYTES];
-	u16 checksum;
+	__be16 checksum;
 } __packed;
 
 /*
  * transfer flags are NOT mutually exclusive
- * 
+ *
  * Initial flags are none; transfer is created and queued from write(). All
- * 	flags are cleared when the transfer is completed by closing the file or
- * 	reading all of the available response data.
+ *  flags are cleared when the transfer is completed by closing the file or
+ *  reading all of the available response data.
  * XFR_IN_PROGRESS is set when a transfer is started from occ_worker_putsram,
- * 	and cleared if the transfer fails or occ_worker_getsram completes.
+ *  and cleared if the transfer fails or occ_worker_getsram completes.
  * XFR_COMPLETE is set when a transfer fails or finishes occ_worker_getsram.
  * XFR_CANCELED is set when the transfer's client is released.
- * XFR_WAITING is set from read() if the transfer isn't complete and
- * 	NONBLOCKING wasn't specified. Cleared in read() when transfer completes
- * 	or fails.
  */
 enum {
 	XFR_IN_PROGRESS,
 	XFR_COMPLETE,
 	XFR_CANCELED,
-	XFR_WAITING,
 };
 
 struct occ_xfr {
@@ -92,9 +90,9 @@ struct occ_xfr {
  * client flags
  *
  * CLIENT_NONBLOCKING is set during open() if the file was opened with the
- * 	O_NONBLOCKING flag.
+ *  O_NONBLOCK flag.
  * CLIENT_XFR_PENDING is set during write() and cleared when all data has been
- * 	read.
+ *  read.
  */
 enum {
 	CLIENT_NONBLOCKING,
@@ -102,9 +100,10 @@ enum {
 };
 
 struct occ_client {
+	struct kref kref;
 	struct occ *occ;
 	struct occ_xfr xfr;
-	spinlock_t lock;
+	spinlock_t lock;		/* lock access to the client state */
 	wait_queue_head_t wait;
 	size_t read_offset;
 	unsigned long flags;
@@ -116,11 +115,14 @@ static struct workqueue_struct *occ_wq;
 
 static DEFINE_IDA(occ_ida);
 
-static void occ_enqueue_xfr(struct occ_xfr *xfr)
+static int occ_enqueue_xfr(struct occ_xfr *xfr)
 {
 	int empty;
 	struct occ_client *client = to_client(xfr);
 	struct occ *occ = client->occ;
+
+	if (occ->cancel)
+		return -ENODEV;
 
 	spin_lock_irq(&occ->list_lock);
 
@@ -131,17 +133,37 @@ static void occ_enqueue_xfr(struct occ_xfr *xfr)
 
 	if (empty)
 		queue_work(occ_wq, &occ->work);
+
+	return 0;
+}
+
+static void occ_get_client(struct occ_client *client)
+{
+	kref_get(&client->kref);
+}
+
+static void occ_client_release(struct kref *kref)
+{
+	struct occ_client *client = container_of(kref, struct occ_client,
+						 kref);
+
+	kfree(client);
+}
+
+static void occ_put_client(struct occ_client *client)
+{
+	kref_put(&client->kref, occ_client_release);
 }
 
 static struct occ_client *occ_open_common(struct occ *occ, unsigned long flags)
 {
-	struct occ_client *client;
+	struct occ_client *client = kzalloc(sizeof(*client), GFP_KERNEL);
 
-	client = kzalloc(sizeof(*client), GFP_KERNEL);
 	if (!client)
 		return NULL;
 
 	client->occ = occ;
+	kref_init(&client->kref);
 	spin_lock_init(&client->lock);
 	init_waitqueue_head(&client->wait);
 
@@ -166,15 +188,29 @@ static int occ_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static inline bool occ_read_ready(struct occ_xfr *xfr, struct occ *occ)
+{
+	return test_bit(XFR_COMPLETE, &xfr->flags) ||
+		test_bit(XFR_CANCELED, &xfr->flags) || occ->cancel;
+}
+
 static ssize_t occ_read_common(struct occ_client *client, char __user *ubuf,
 			       char *kbuf, size_t len)
 {
 	int rc;
 	size_t bytes;
-	struct occ_xfr *xfr = &client->xfr;
+	struct occ_xfr *xfr;
+	struct occ *occ;
+
+	if (!client)
+		return -ENODEV;
 
 	if (len > OCC_SRAM_BYTES)
 		return -EINVAL;
+
+	occ_get_client(client);
+	xfr = &client->xfr;
+	occ = client->occ;
 
 	spin_lock_irq(&client->lock);
 
@@ -183,8 +219,9 @@ static ssize_t occ_read_common(struct occ_client *client, char __user *ubuf,
 		if (client->read_offset) {
 			rc = 0;
 			client->read_offset = 0;
-		} else
+		} else {
 			rc = -ENOMSG;
+		}
 
 		goto done;
 	}
@@ -195,25 +232,19 @@ static ssize_t occ_read_common(struct occ_client *client, char __user *ubuf,
 			goto done;
 		}
 
-		set_bit(XFR_WAITING, &xfr->flags);
-
 		spin_unlock_irq(&client->lock);
 
 		rc = wait_event_interruptible(client->wait,
-			test_bit(XFR_COMPLETE, &xfr->flags) ||
-			test_bit(XFR_CANCELED, &xfr->flags));
+					      occ_read_ready(xfr, occ));
 
 		spin_lock_irq(&client->lock);
 
-		if (test_bit(XFR_CANCELED, &xfr->flags)) {
-			spin_unlock_irq(&client->lock);
-			kfree(client);
-			return -EBADFD;
-		}
-
-		clear_bit(XFR_WAITING, &xfr->flags);
 		if (!test_bit(XFR_COMPLETE, &xfr->flags)) {
-			rc = -EINTR;
+			if (occ->cancel || test_bit(XFR_CANCELED, &xfr->flags))
+				rc = -ENODEV;
+			else
+				rc = -EINTR;
+
 			goto done;
 		}
 	}
@@ -225,12 +256,14 @@ static ssize_t occ_read_common(struct occ_client *client, char __user *ubuf,
 
 	bytes = min(len, xfr->resp_data_length - client->read_offset);
 	if (ubuf) {
-		if (copy_to_user(ubuf, &xfr->buf[client->read_offset], bytes)) {
+		if (copy_to_user(ubuf, &xfr->buf[client->read_offset],
+				 bytes)) {
 			rc = -EFAULT;
 			goto done;
 		}
-	} else
+	} else {
 		memcpy(kbuf, &xfr->buf[client->read_offset], bytes);
+	}
 
 	client->read_offset += bytes;
 
@@ -242,6 +275,7 @@ static ssize_t occ_read_common(struct occ_client *client, char __user *ubuf,
 
 done:
 	spin_unlock_irq(&client->lock);
+	occ_put_client(client);
 	return rc;
 }
 
@@ -249,12 +283,6 @@ static ssize_t occ_read(struct file *file, char __user *buf, size_t len,
 			loff_t *offset)
 {
 	struct occ_client *client = file->private_data;
-
-	/* check this ahead of time so we don't go changing the xfr state
-	 * needlessly
-	 */
-	if (!access_ok(VERIFY_WRITE, buf, len))
-		return -EFAULT;
 
 	return occ_read_common(client, buf, NULL, len);
 }
@@ -266,34 +294,44 @@ static ssize_t occ_write_common(struct occ_client *client,
 	int rc;
 	unsigned int i;
 	u16 data_length, checksum = 0;
-	struct occ_xfr *xfr = &client->xfr;
+	struct occ_xfr *xfr;
+
+	if (!client)
+		return -ENODEV;
 
 	if (len > (OCC_CMD_DATA_BYTES + 3) || len < 3)
 		return -EINVAL;
 
+	occ_get_client(client);
+	xfr = &client->xfr;
+
 	spin_lock_irq(&client->lock);
-	if (test_and_set_bit(CLIENT_XFR_PENDING, &client->flags)) {
+
+	if (test_bit(CLIENT_XFR_PENDING, &client->flags)) {
 		rc = -EBUSY;
 		goto done;
 	}
 
-	/* clear out the transfer */
-	memset(xfr, 0, sizeof(*xfr));
+	memset(xfr, 0, sizeof(*xfr));	/* clear out the transfer */
+	xfr->buf[0] = 1;		/* occ sequence number */
 
-	xfr->buf[0] = 1;
-
+	/*
+	 * Assume user data follows the occ command format.
+	 * byte 0: command type
+	 * bytes 1-2: data length (msb first)
+	 * bytes 3-n: data
+	 */
 	if (ubuf) {
 		if (copy_from_user(&xfr->buf[1], ubuf, len)) {
-			kfree(xfr);
 			rc = -EFAULT;
 			goto done;
 		}
-	} else
+	} else {
 		memcpy(&xfr->buf[1], kbuf, len);
+	}
 
 	data_length = (xfr->buf[2] << 8) + xfr->buf[3];
 	if (data_length > OCC_CMD_DATA_BYTES) {
-		kfree(xfr);
 		rc = -EINVAL;
 		goto done;
 	}
@@ -307,12 +345,16 @@ static ssize_t occ_write_common(struct occ_client *client,
 	xfr->cmd_data_length = data_length + 6;
 	client->read_offset = 0;
 
-	occ_enqueue_xfr(xfr);
+	rc = occ_enqueue_xfr(xfr);
+	if (rc)
+		goto done;
 
+	set_bit(CLIENT_XFR_PENDING, &client->flags);
 	rc = len;
 
 done:
 	spin_unlock_irq(&client->lock);
+	occ_put_client(client);
 	return rc;
 }
 
@@ -321,54 +363,42 @@ static ssize_t occ_write(struct file *file, const char __user *buf,
 {
 	struct occ_client *client = file->private_data;
 
-	/* check this ahead of time so we don't go changing the xfr state
-	 * needlessly
-	 */
-	if (!access_ok(VERIFY_READ, buf, len))
-		return -EFAULT;
-
 	return occ_write_common(client, buf, NULL, len);
 }
 
 static int occ_release_common(struct occ_client *client)
 {
-	struct occ_xfr *xfr = &client->xfr;
-	struct occ *occ = client->occ;
+	struct occ *occ;
+	struct occ_xfr *xfr;
+
+	if (!client)
+		return -ENODEV;
+
+	xfr = &client->xfr;
+	occ = client->occ;
 
 	spin_lock_irq(&client->lock);
 
-	if (!test_bit(CLIENT_XFR_PENDING, &client->flags)) {
-		spin_unlock_irq(&client->lock);
-		kfree(client);
-		return 0;
-	}
+	set_bit(XFR_CANCELED, &xfr->flags);
+	if (!test_bit(CLIENT_XFR_PENDING, &client->flags))
+		goto done;
 
 	spin_lock_irq(&occ->list_lock);
 
-	set_bit(XFR_CANCELED, &xfr->flags);
 	if (!test_bit(XFR_IN_PROGRESS, &xfr->flags)) {
 		/* already deleted from list if complete */
 		if (!test_bit(XFR_COMPLETE, &xfr->flags))
 			list_del(&xfr->link);
-
-		spin_unlock_irq(&occ->list_lock);
-
-		if (test_bit(XFR_WAITING, &xfr->flags)) {
-			/* blocking read; let reader clean up */
-			wake_up_interruptible(&client->wait);
-			spin_unlock_irq(&client->lock);
-			return 0;
-		}
-
-		spin_unlock_irq(&client->lock);
-
-		kfree(client);
-		return 0;
 	}
 
-	/* operation is in progress; let worker clean up*/
 	spin_unlock_irq(&occ->list_lock);
+
+	wake_up_all(&client->wait);
+
+done:
 	spin_unlock_irq(&client->lock);
+
+	occ_put_client(client);
 	return 0;
 }
 
@@ -403,7 +433,7 @@ static int occ_write_sbefifo(struct sbefifo_client *client, const char *buf,
 		total += rc;
 	} while (total < len);
 
-	return (total == len) ? 0 : -EMSGSIZE;
+	return (total == len) ? 0 : -ENOSPC;
 }
 
 static int occ_read_sbefifo(struct sbefifo_client *client, char *buf,
@@ -422,7 +452,7 @@ static int occ_read_sbefifo(struct sbefifo_client *client, char *buf,
 		total += rc;
 	} while (total < len);
 
-	return (total == len) ? 0 : -EMSGSIZE;
+	return (total == len) ? 0 : -ENODATA;
 }
 
 static int occ_getsram(struct device *sbefifo, u32 address, u8 *data,
@@ -430,10 +460,14 @@ static int occ_getsram(struct device *sbefifo, u32 address, u8 *data,
 {
 	int rc;
 	u8 *resp;
-	u32 buf[5];
-	u32 data_len = ((len + 7) / 8) * 8;
+	__be32 buf[5];
+	u32 data_len = ((len + 7) / 8) * 8;	/* must be multiples of 8 B */
 	struct sbefifo_client *client;
 
+	/*
+	 * Magic sequence to do SBE getsram command. SBE will fetch data from
+	 * specified SRAM address.
+	 */
 	buf[0] = cpu_to_be32(0x5);
 	buf[1] = cpu_to_be32(0xa403);
 	buf[2] = cpu_to_be32(1);
@@ -447,7 +481,7 @@ static int occ_getsram(struct device *sbefifo, u32 address, u8 *data,
 	rc = occ_write_sbefifo(client, (const char *)buf, sizeof(buf));
 	if (rc)
 		goto done;
-	
+
 	resp = kzalloc(data_len, GFP_KERNEL);
 	if (!resp) {
 		rc = -ENOMEM;
@@ -467,7 +501,7 @@ static int occ_getsram(struct device *sbefifo, u32 address, u8 *data,
 	    (be32_to_cpu(buf[1]) == 0xC0DEA403))
 		memcpy(data, resp, len);
 	else
-		rc = -EFAULT;
+		rc = -EBADMSG;
 
 free:
 	kfree(resp);
@@ -481,8 +515,8 @@ static int occ_putsram(struct device *sbefifo, u32 address, u8 *data,
 		       ssize_t len)
 {
 	int rc;
-	u32 *buf;
-	u32 data_len = ((len + 7) / 8) * 8;
+	__be32 *buf;
+	u32 data_len = ((len + 7) / 8) * 8;	/* must be multiples of 8 B */
 	size_t cmd_len = data_len + 20;
 	struct sbefifo_client *client;
 
@@ -490,6 +524,10 @@ static int occ_putsram(struct device *sbefifo, u32 address, u8 *data,
 	if (!buf)
 		return -ENOMEM;
 
+	/*
+	 * Magic sequence to do SBE putsram command. SBE will transfer
+	 * data to specified SRAM address.
+	 */
 	buf[0] = cpu_to_be32(0x5 + (data_len / 4));
 	buf[1] = cpu_to_be32(0xa404);
 	buf[2] = cpu_to_be32(1);
@@ -515,7 +553,7 @@ static int occ_putsram(struct device *sbefifo, u32 address, u8 *data,
 	/* check for good response */
 	if ((be32_to_cpu(buf[0]) != data_len) ||
 	    (be32_to_cpu(buf[1]) != 0xC0DEA404))
-		rc = -EFAULT;
+		rc = -EBADMSG;
 
 done:
 	sbefifo_drv_release(client);
@@ -527,14 +565,18 @@ free:
 static int occ_trigger_attn(struct device *sbefifo)
 {
 	int rc;
-	u32 buf[6];
+	__be32 buf[6];
 	struct sbefifo_client *client;
 
+	/*
+	 * Magic sequence to do SBE putscom command. SBE will write 8 bytes to
+	 * specified SCOM address.
+	 */
 	buf[0] = cpu_to_be32(0x6);
 	buf[1] = cpu_to_be32(0xa202);
 	buf[2] = 0;
 	buf[3] = cpu_to_be32(0x6D035);
-	buf[4] = cpu_to_be32(0x20010000);
+	buf[4] = cpu_to_be32(0x20010000);	/* trigger occ attention */
 	buf[5] = 0;
 
 	client = sbefifo_drv_open(sbefifo, 0);
@@ -552,7 +594,7 @@ static int occ_trigger_attn(struct device *sbefifo)
 	/* check for good response */
 	if ((be32_to_cpu(buf[0]) != 0xC0DEA202) ||
 	    (be32_to_cpu(buf[1]) & 0x0FFFFFFF))
-		rc = -EFAULT;
+		rc = -EBADMSG;
 
 done:
 	sbefifo_drv_release(client);
@@ -562,14 +604,21 @@ done:
 
 static void occ_worker(struct work_struct *work)
 {
-	int rc = 0, empty, waiting, canceled;
+	int rc = 0, empty;
 	u16 resp_data_length;
+	unsigned long start;
+	const unsigned long timeout = msecs_to_jiffies(OCC_TIMEOUT_MS);
+	const long int wait_time = msecs_to_jiffies(OCC_CMD_IN_PRG_WAIT_MS);
 	struct occ_xfr *xfr;
+	struct occ_response *resp;
 	struct occ_client *client;
 	struct occ *occ = container_of(work, struct occ, work);
 	struct device *sbefifo = occ->sbefifo;
 
 again:
+	if (occ->cancel)
+		return;
+
 	spin_lock_irq(&occ->list_lock);
 
 	xfr = list_first_entry_or_null(&occ->xfrs, struct occ_xfr, link);
@@ -578,11 +627,17 @@ again:
 		return;
 	}
 
+	client = to_client(xfr);
+	occ_get_client(client);
+	resp = (struct occ_response *)xfr->buf;
 	set_bit(XFR_IN_PROGRESS, &xfr->flags);
 
 	spin_unlock_irq(&occ->list_lock);
 	mutex_lock(&occ->occ_lock);
 
+	start = jiffies;
+
+	/* write occ command */
 	rc = occ_putsram(sbefifo, 0xFFFBE000, xfr->buf,
 			 xfr->cmd_data_length);
 	if (rc)
@@ -592,13 +647,26 @@ again:
 	if (rc)
 		goto done;
 
-	rc = occ_getsram(sbefifo, 0xFFFBF000, xfr->buf, 8);
-	if (rc)
-		goto done;
+	/* read occ response */
+	do {
+		rc = occ_getsram(sbefifo, 0xFFFBF000, xfr->buf, 8);
+		if (rc)
+			goto done;
 
-	resp_data_length = (xfr->buf[3] << 8) + xfr->buf[4];
+		if (resp->return_status == OCC_RESP_CMD_IN_PRG) {
+			rc = -EALREADY;
+
+			if (time_after(jiffies, start + timeout))
+				break;
+
+			set_current_state(TASK_INTERRUPTIBLE);
+			schedule_timeout(wait_time);
+		}
+	} while (rc);
+
+	resp_data_length = get_unaligned_be16(&resp->data_length);
 	if (resp_data_length > OCC_RESP_DATA_BYTES) {
-		rc = -EDOM;
+		rc = -EMSGSIZE;
 		goto done;
 	}
 
@@ -616,29 +684,18 @@ done:
 	mutex_unlock(&occ->occ_lock);
 
 	xfr->rc = rc;
-	client = to_client(xfr);
-
-	/* lock client to prevent race with read() */
-	spin_lock_irq(&client->lock);
-
 	set_bit(XFR_COMPLETE, &xfr->flags);
-	waiting = test_bit(XFR_WAITING, &xfr->flags);
-
-	spin_unlock_irq(&client->lock);
 
 	spin_lock_irq(&occ->list_lock);
 
 	clear_bit(XFR_IN_PROGRESS, &xfr->flags);
 	list_del(&xfr->link);
 	empty = list_empty(&occ->xfrs);
-	canceled = test_bit(XFR_CANCELED, &xfr->flags);
 
 	spin_unlock_irq(&occ->list_lock);
 
-	if (waiting)
-		wake_up_interruptible(&client->wait);
-	else if (canceled)
-		kfree(client);
+	wake_up_interruptible(&client->wait);
+	occ_put_client(client);
 
 	if (!empty)
 		goto again;
@@ -704,9 +761,6 @@ static int occ_probe(struct platform_device *pdev)
 	mutex_init(&occ->occ_lock);
 	INIT_WORK(&occ->work, occ_worker);
 
-	/* ensure NULL before we probe children, so they don't hang FSI */
-	platform_set_drvdata(pdev, NULL);
-
 	if (dev->of_node) {
 		rc = of_property_read_u32(dev->of_node, "reg", &reg);
 		if (!rc) {
@@ -716,23 +770,13 @@ static int occ_probe(struct platform_device *pdev)
 			if (occ->idx < 0)
 				occ->idx = ida_simple_get(&occ_ida, 1, INT_MAX,
 							  GFP_KERNEL);
-		} else
+		} else {
 			occ->idx = ida_simple_get(&occ_ida, 1, INT_MAX,
 						  GFP_KERNEL);
-
-		/* create platform devs for dts child nodes (hwmon, etc) */
-		for_each_child_of_node(dev->of_node, np) {
-			snprintf(child_name, sizeof(child_name), "occ%d-dev%d",
-				 occ->idx, child_idx++);
-			child = of_platform_device_create(np, child_name, dev);
-			if (!child)
-				dev_warn(dev,
-					 "failed to create child node dev\n");
 		}
-	} else
+	} else {
 		occ->idx = ida_simple_get(&occ_ida, 1, INT_MAX, GFP_KERNEL);
-
-	platform_set_drvdata(pdev, occ);
+	}
 
 	snprintf(occ->name, sizeof(occ->name), "occ%d", occ->idx);
 	occ->mdev.fops = &occ_fops;
@@ -742,9 +786,21 @@ static int occ_probe(struct platform_device *pdev)
 
 	rc = misc_register(&occ->mdev);
 	if (rc) {
-		dev_err(dev, "failed to register miscdevice\n");
+		dev_err(dev, "failed to register miscdevice: %d\n", rc);
+		ida_simple_remove(&occ_ida, occ->idx);
 		return rc;
 	}
+
+	/* create platform devs for dts child nodes (hwmon, etc) */
+	for_each_available_child_of_node(dev->of_node, np) {
+		snprintf(child_name, sizeof(child_name), "occ%d-dev%d",
+			 occ->idx, child_idx++);
+		child = of_platform_device_create(np, child_name, dev);
+		if (!child)
+			dev_warn(dev, "failed to create child node dev\n");
+	}
+
+	platform_set_drvdata(pdev, occ);
 
 	return 0;
 }
@@ -752,10 +808,23 @@ static int occ_probe(struct platform_device *pdev)
 static int occ_remove(struct platform_device *pdev)
 {
 	struct occ *occ = platform_get_drvdata(pdev);
+	struct occ_xfr *xfr;
+	struct occ_client *client;
 
-	flush_work(&occ->work);
+	occ->cancel = true;
+
+	spin_lock_irq(&occ->list_lock);
+	list_for_each_entry(xfr, &occ->xfrs, link) {
+		client = to_client(xfr);
+		wake_up_all(&client->wait);
+	}
+	spin_unlock_irq(&occ->list_lock);
+
 	misc_deregister(&occ->mdev);
 	device_for_each_child(&pdev->dev, NULL, occ_unregister_child);
+
+	cancel_work_sync(&occ->work);
+
 	ida_simple_remove(&occ_ida, occ->idx);
 
 	return 0;
@@ -789,6 +858,8 @@ static void occ_exit(void)
 	destroy_workqueue(occ_wq);
 
 	platform_driver_unregister(&occ_driver);
+
+	ida_destroy(&occ_ida);
 }
 
 module_init(occ_init);
