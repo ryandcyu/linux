@@ -166,33 +166,6 @@ static void __init do_zaius_setup(void)
 	board_rev = (reg >> 3) & 0x1F;
 	printk(KERN_INFO "Zaius platform board revision: 0x%02lx\n", board_rev);
 
-	/* EVT boards have different FSI pin mappings */
-	if (board_rev < 0x08) {
-		static struct gpiod_lookup_table fsi_evt_gpio_lookup = {
-			.dev_id = "gpio-fsi",
-			.table = {
-				GPIO_LOOKUP("1e780000.gpio", ASPEED_GPIO(C, 3),
-					    "clock", GPIO_ACTIVE_HIGH),
-				GPIO_LOOKUP("1e780000.gpio", ASPEED_GPIO(C, 2),
-					    "data", GPIO_ACTIVE_HIGH),
-				{ },
-			},
-		};
-		gpiod_add_lookup_table(&fsi_evt_gpio_lookup);
-	} else {
-		static struct gpiod_lookup_table fsi_gpio_lookup = {
-			.dev_id = "gpio-fsi",
-			.table = {
-				GPIO_LOOKUP("1e780000.gpio", ASPEED_GPIO(G, 0),
-					    "clock", GPIO_ACTIVE_HIGH),
-				GPIO_LOOKUP("1e780000.gpio", ASPEED_GPIO(G, 1),
-					    "data", GPIO_ACTIVE_HIGH),
-				{ },
-			},
-		};
-		gpiod_add_lookup_table(&fsi_gpio_lookup);
-	}
-
 	/* Set GPIOL5 for BMC Ready*/
 	reg = readl(AST_IO(AST_BASE_GPIO | 0x70));
 	reg &= ~(BIT(29));
