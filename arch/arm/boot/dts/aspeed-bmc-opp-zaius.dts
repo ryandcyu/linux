@@ -311,28 +311,7 @@
 
 
 &i2c9 {
-	status = "okay";
-
-	nct7904@2d {
-		compatible = "nuvoton,nct7904";
-		reg = <0x2d>;
-	};
-
-	nct7904@2e {
-		compatible = "nuvoton,nct7904";
-		reg = <0x2e>;
-	};
-
-	/* Fan board */
-	lm75@4a {
-		compatible = "national,lm75";
-		reg = <0x4a>;
-	};
-
-	lm75@4f {
-		compatible = "national,lm75";
-		reg = <0x4f>;
-	};
+	status = "disabled";
 };
 
 &i2c10 {
