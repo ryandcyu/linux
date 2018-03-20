@@ -326,7 +326,7 @@
 
 
 &i2c5 {
-	status = "disabled";
+	status = "okay";
 
 	/* I2C BUFFER PCA9617 DEPOP
 	 * APSS TMS320F28033PNT @00h
@@ -334,7 +334,7 @@
 };
 
 &i2c6 {
-	status = "disabled";
+	status = "okay";
 
 	/* I2C BUFFER PCA9617 DEPOP */
 };
@@ -360,25 +360,25 @@
 
 
 &i2c9 {
-	status = "disabled";
+	status = "okay";
 };
 
 &i2c10 {
-	status = "disabled";
+	status = "okay";
 };
 
 &i2c11 {
-	status = "disabled";
+	status = "okay";
 
 	/* GPU sideband */
 };
 
 &i2c12 {
-	status = "disabled";
+	status = "okay";
 };
 
 &i2c13 {
-	status = "disabled";
+	status = "okay";
 
 	/* MUX PI3USB102
 	 *   CPU0 debug
